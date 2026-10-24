@@ -1,4 +1,4 @@
-# Instruent
+# Instrent
 
 A React + Vite + TypeScript rental marketplace app.
 
