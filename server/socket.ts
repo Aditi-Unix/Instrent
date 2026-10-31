@@ -1,12 +1,12 @@
-import { verifyToken } from '@clerk/backend';
 import type { Server as HttpServer } from 'node:http';
 import { Server } from 'socket.io';
+import { decodeJwt } from 'jose';
 import { z } from 'zod';
 import pino from 'pino';
 import { prisma } from './prisma.js';
 import { isAllowedOrigin } from './config/cors.js';
 import { env } from './config/env.js';
-import { syncLegacyMessageStatus } from './legacy-sync.js';
+import { verifyAccessToken } from './auth.js';
 
 const logger = pino({ level: env.NODE_ENV === 'production' ? 'info' : 'debug' });
 
@@ -27,6 +27,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
         else callback(new Error('Origin not allowed'));
       },
       credentials: true,
+      methods: ['GET', 'POST'],
     },
   });
 
@@ -38,18 +39,14 @@ export function createSocketServer(httpServer: HttpServer): Server {
     }
 
     try {
-      const claims = await verifyToken(token, {
-        secretKey: env.CLERK_SECRET_KEY,
-      });
-      const user = await prisma.user.findUnique({
-        where: { clerkId: claims.sub },
-        select: { id: true },
-      });
-      if (!user) {
-        next(new Error('Profile not found'));
+      const user = await verifyAccessToken(token);
+      socket.data.userId = user.id;
+      const expiry = decodeJwt(token).exp;
+      if (!expiry || expiry <= Math.floor(Date.now() / 1000)) {
+        next(new Error('Authentication token expired'));
         return;
       }
-      socket.data.userId = user.id;
+      socket.data.accessTokenExpiresAt = expiry * 1000;
       next();
     } catch (error) {
       logger.warn({ errorName: error instanceof Error ? error.name : 'UnknownError' }, 'Socket authentication failed');
@@ -61,6 +58,11 @@ export function createSocketServer(httpServer: HttpServer): Server {
     const userId = socket.data.userId as string;
     const joinedConversations = new Set<string>();
     const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const expiresIn = (socket.data.accessTokenExpiresAt as number) - Date.now();
+    const expiryTimer = setTimeout(() => {
+      socket.emit('auth:expired');
+      socket.disconnect(true);
+    }, Math.max(0, expiresIn));
     socket.join(`user:${userId}`);
     io.emit('presence:online', { userId });
     void io.fetchSockets().then((sockets) => {
@@ -214,7 +216,6 @@ export function createSocketServer(httpServer: HttpServer): Server {
           data: { deliveredAt },
         });
         if (result.count > 0) {
-          await syncLegacyMessageStatus(prisma, { id: message.id, isRead: false });
           io.to(`user:${message.senderId}`).emit('message:delivered', {
             messageId: message.id,
             deliveredAt: deliveredAt.toISOString(),
@@ -251,7 +252,6 @@ export function createSocketServer(httpServer: HttpServer): Server {
           data: { isRead: true },
         });
         if (result.count > 0) {
-          await syncLegacyMessageStatus(prisma, { id: message.id, isRead: true });
           io.to(`user:${message.senderId}`).emit('message:read', { messageId: message.id });
         }
         acknowledge?.({ success: true });
@@ -262,6 +262,7 @@ export function createSocketServer(httpServer: HttpServer): Server {
     });
 
     socket.on('disconnect', () => {
+      clearTimeout(expiryTimer);
       for (const [conversationId, timer] of typingTimers) {
         clearTimeout(timer);
         const typingRoom = `conversation:${conversationId}`;

@@ -6,7 +6,6 @@ import { z } from 'zod';
 import { verifyUploadedAsset, deleteCloudinaryAssets } from '../../cloudinary.js';
 import { canManageRoom, canViewRoomAddress } from './authorization.js';
 import { roomCreateSchema, roomSearchSchema, roomUpdateSchema, roommateProfileSchema, roommateSearchSchema } from './validation.js';
-import { deleteLegacyRoom, syncLegacyRoom } from '../../legacy-sync.js';
 
 type RoomRoutesDependencies = {
   prisma: PrismaClient;
@@ -98,9 +97,9 @@ const publicRoom = (room: {
 });
 
 const getViewer = async (req: Request, res: Response, prisma: PrismaClient) => {
-  const clerkUserId = res.locals.clerkUserId as string | undefined;
-  if (!clerkUserId) return null;
-  return prisma.user.findUnique({ where: { clerkId: clerkUserId } });
+  const userId = res.locals.userId as string | undefined;
+  if (!userId) return null;
+  return prisma.user.findUnique({ where: { id: userId } });
 };
 
 const roomInclude = (viewerId: string) => ({
@@ -176,7 +175,12 @@ const createConversationForRoom = async (
 ) => {
   const pairKey = [viewerId, ownerId].sort().join(':');
   const existing = await prisma.conversation.findUnique({ where: { pairKey } });
-  if (existing) return existing;
+  if (existing) {
+    return prisma.conversation.update({
+      where: { id: existing.id },
+      data: { activeContext: { type: 'ROOM', id: roomId, title: roomTitle } },
+    });
+  }
   try {
     return await prisma.conversation.create({
       data: {
@@ -196,7 +200,15 @@ const createConversationForRoom = async (
 
 export function createRoomRouter({ prisma, requireUser, writeLimiter, io }: RoomRoutesDependencies) {
   const router = Router();
-  router.use(requireUser);
+  router.use((req, res, next) => {
+    const requiresUser = req.path === '/rooms'
+      || req.path.startsWith('/rooms/')
+      || req.path === '/saved/rooms'
+      || req.path === '/roommate-profile/me'
+      || req.path === '/roommates';
+    if (requiresUser) return requireUser(req, res, next);
+    next();
+  });
 
   router.get('/rooms', async (req, res, next) => {
     try {
@@ -323,7 +335,6 @@ export function createRoomRouter({ prisma, requireUser, writeLimiter, io }: Room
         }
         return created;
       });
-      await syncLegacyRoom(prisma, room);
       res.status(201).json({ success: true, room: publicRoom(room, viewer.id) });
     } catch (error) {
       next(error);
@@ -428,7 +439,6 @@ export function createRoomRouter({ prisma, requireUser, writeLimiter, io }: Room
           resourceType: asset.resourceType === 'video' ? 'video' as const : 'image' as const,
         })));
       }
-      await syncLegacyRoom(prisma, room);
       res.json({ success: true, room: publicRoom(room, viewer.id) });
     } catch (error) {
       next(error);
@@ -460,7 +470,6 @@ export function createRoomRouter({ prisma, requireUser, writeLimiter, io }: Room
         await transaction.room.delete({ where: { id: roomId } });
         await transaction.mediaUpload.deleteMany({ where: { publicId: { in: room.media.map((asset) => asset.publicId) } } });
       });
-      await deleteLegacyRoom(prisma, roomId);
       res.json({ success: true });
     } catch (error) {
       next(error);

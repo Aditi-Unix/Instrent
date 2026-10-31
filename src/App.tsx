@@ -1,11 +1,11 @@
 import React, { Suspense, useEffect } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import { useApp } from './context/AppContext.tsx';
 import { Sidebar } from './components/layout/Sidebar.tsx';
 import { MobileNav } from './components/layout/MobileNav.tsx';
 import { Header } from './components/layout/Header.tsx';
 import { NotificationsDrawer } from './components/notifications/NotificationsDrawer.tsx';
 import { SearchModal } from './components/search/SearchModal.tsx';
-import { VisitScheduleModal } from './components/modals/VisitScheduleModal.tsx';
 
 const HomeView = React.lazy(() => import('./components/home/HomeView.tsx').then(({ HomeView }) => ({ default: HomeView })));
 const ReelsView = React.lazy(() => import('./components/reels/ReelsView.tsx').then(({ ReelsView }) => ({ default: ReelsView })));
@@ -15,10 +15,7 @@ const RoommateFinderView = React.lazy(() => import('./components/roommates/Roomm
 const MessagesView = React.lazy(() => import('./components/messages/MessagesView.tsx').then(({ MessagesView }) => ({ default: MessagesView })));
 const SavedView = React.lazy(() => import('./components/saved/SavedView.tsx').then(({ SavedView }) => ({ default: SavedView })));
 const SettingsView = React.lazy(() => import('./components/settings/SettingsView.tsx').then(({ SettingsView }) => ({ default: SettingsView })));
-const PropertyProfileView = React.lazy(() => import('./components/profile/PropertyProfileView.tsx').then(({ PropertyProfileView }) => ({ default: PropertyProfileView })));
 const TenantProfileView = React.lazy(() => import('./components/profile/TenantProfileView.tsx').then(({ TenantProfileView }) => ({ default: TenantProfileView })));
-const OwnerDashboard = React.lazy(() => import('./components/dashboard/OwnerDashboard.tsx').then(({ OwnerDashboard }) => ({ default: OwnerDashboard })));
-const AdminDashboard = React.lazy(() => import('./components/dashboard/AdminDashboard.tsx').then(({ AdminDashboard }) => ({ default: AdminDashboard })));
 const CreateModal = React.lazy(() => import('./components/create/CreateModal.tsx').then(({ CreateModal }) => ({ default: CreateModal })));
 
 const AppContent: React.FC = () => {
@@ -76,12 +73,6 @@ const AppContent: React.FC = () => {
             )}
             {activeView === 'saved' && <SavedView />}
             {activeView === 'settings' && <SettingsView />}
-            {activeView === 'property-profile' && (
-              <PropertyProfileView
-                propertyId={viewParams.propertyId}
-                onBack={() => setActiveView('home')}
-              />
-            )}
             {activeView === 'user-profile' && (
               <TenantProfileView
                 username={viewParams.username || currentUser?.username || ''}
@@ -89,8 +80,6 @@ const AppContent: React.FC = () => {
                 onBack={() => setActiveView('home')}
               />
             )}
-            {activeView === 'owner-dashboard' && <OwnerDashboard />}
-            {activeView === 'admin-dashboard' && <AdminDashboard />}
           </Suspense>
         </main>
 
@@ -106,7 +95,6 @@ const AppContent: React.FC = () => {
       )}
       <NotificationsDrawer isOpen={isNotificationsOpen} onClose={closeNotifications} />
       <SearchModal isOpen={isSearchOpen} onClose={closeSearch} />
-      <VisitScheduleModal />
 
       {/* Lightweight Floating Toast Notifications */}
       {toasts.length > 0 && (
@@ -134,5 +122,10 @@ const AppContent: React.FC = () => {
 };
 
 export default function App() {
-  return <AppContent />;
+  return (
+    <>
+      <AppContent />
+      <Analytics />
+    </>
+  );
 }

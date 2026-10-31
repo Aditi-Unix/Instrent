@@ -18,7 +18,7 @@ import type {
   MessageContext,
 } from '../types/client';
 
-import { api, getClerkAccessToken } from '../lib/api';
+import { api, API_URL, ApiError, getAccessToken } from '../lib/api';
 
 interface ToastInfo {
   id: string;
@@ -48,9 +48,7 @@ interface AppContextType {
     context?: MessageContext
   ) => Promise<void>;
 
-  openPropertyProfile: (propertyId: string) => void;
   openUserProfile: (username: string) => void;
-  openListingDetail: (listingId: string) => void;
   switchUserRole: (role: UserRole) => Promise<void>;
   signOut: () => Promise<void>;
 
@@ -60,25 +58,10 @@ interface AppContextType {
     type?: 'success' | 'info' | 'warning' | 'error'
   ) => void;
 
-  refreshUserData: () => Promise<void>;
+  refreshUserData: () => Promise<boolean>;
   refreshNotifications: () => Promise<void>;
   refreshUnreadMessages: () => Promise<void>;
   realtimeSocket: Socket | null;
-
-  scheduleVisitData: {
-    isOpen: boolean;
-    propertyId?: string;
-    propertyTitle?: string;
-    ownerId?: string;
-  };
-
-  openScheduleVisit: (
-    propertyId: string,
-    propertyTitle: string,
-    ownerId: string
-  ) => void;
-
-  closeScheduleVisit: () => void;
 
   isNotificationsOpen: boolean;
   openNotifications: () => void;
@@ -94,11 +77,9 @@ const realtimeDisconnectWarningDelayMs = 6_000;
 
 export const AppProvider = ({
   children,
-  clerkUserId,
   onSignOut,
 }: {
   children: ReactNode;
-  clerkUserId: string;
   onSignOut: () => Promise<void>;
 }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -129,15 +110,8 @@ export const AppProvider = ({
 
   const [isSearchOpen, setIsSearchOpen] = useState(false);
 
-  const [scheduleVisitData, setScheduleVisitData] = useState<{
-    isOpen: boolean;
-    propertyId?: string;
-    propertyTitle?: string;
-    ownerId?: string;
-  }>({ isOpen: false });
-
   const toastTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const userSyncRequest = useRef<Promise<void> | null>(null);
+  const userSyncRequest = useRef<Promise<boolean> | null>(null);
 
   const showToast = useCallback((
     message: string,
@@ -172,16 +146,21 @@ export const AppProvider = ({
     };
   }, []);
 
-  const refreshUserData = useCallback(async (): Promise<void> => {
+  const refreshUserData = useCallback(async (): Promise<boolean> => {
     if (userSyncRequest.current) return userSyncRequest.current;
     const request = (async () => {
       try {
         const data = await api.syncCurrentUser();
         setCurrentUser(data.user);
         setUserLoadError(null);
+        return true;
       } catch (error) {
-        console.error('Failed to sync the Clerk account with the app profile:', error);
+        console.error('Failed to sync the account with the app profile:', error);
         setCurrentUser(null);
+        if (error instanceof ApiError && (error.status === 401 || error.status === 404 || error.code === 'UNAUTHENTICATED')) {
+          setUserLoadError(null);
+          return false;
+        }
         throw error;
       }
     })();
@@ -193,6 +172,7 @@ export const AppProvider = ({
         userSyncRequest.current = null;
       }
     }
+    return request;
   }, []);
 
   const refreshUnreadMessages = useCallback(async (): Promise<void> => {
@@ -220,9 +200,9 @@ export const AppProvider = ({
 
     const initializeUser = async () => {
       try {
-        await refreshUserData();
+        const hasProfile = await refreshUserData();
 
-        if (!isMounted) return;
+        if (!isMounted || !hasProfile) return;
 
         await Promise.all([refreshNotifications(), refreshUnreadMessages()]);
       } catch (error: unknown) {
@@ -247,7 +227,7 @@ export const AppProvider = ({
     return () => {
       isMounted = false;
     };
-  }, [clerkUserId, refreshNotifications, refreshUnreadMessages, refreshUserData]);
+  }, [refreshNotifications, refreshUnreadMessages, refreshUserData]);
 
   const currentUserId = currentUser?.id;
 
@@ -277,12 +257,8 @@ export const AppProvider = ({
     void import('socket.io-client')
       .then(({ io }) => {
         if (isCancelled) return;
-        const connectedSocket = io({
-          auth: (callback) => {
-            void getClerkAccessToken()
-              .then((token) => callback({ token: token ?? '' }))
-              .catch(() => callback({ token: '' }));
-          },
+        const connectedSocket = io(API_URL || undefined, {
+          auth: (callback) => callback({ token: getAccessToken() ?? '' }),
         });
         socket = connectedSocket;
         setRealtimeSocket(connectedSocket);
@@ -314,6 +290,21 @@ export const AppProvider = ({
         };
 
         connectedSocket.on('connect', handleConnect);
+        const handleAuthExpired = () => {
+          connectedSocket.disconnect();
+          void api.auth.restore()
+            .then(() => connectedSocket.connect())
+            .catch(() => undefined);
+        };
+        const handleAuthConnectError = (error: Error) => {
+          if (/expired|invalid authentication token/i.test(error.message)) {
+            void api.auth.restore()
+              .then(() => connectedSocket.connect())
+              .catch(() => undefined);
+          }
+        };
+        connectedSocket.on('auth:expired', handleAuthExpired);
+        connectedSocket.on('connect_error', handleAuthConnectError);
         connectedSocket.on('disconnect', handleDisconnect);
         connectedSocket.on('connect_error', handleConnectError);
         connectedSocket.on('message:new', handleIncomingMessage);
@@ -323,6 +314,8 @@ export const AppProvider = ({
           connectedSocket.off('connect', handleConnect);
           connectedSocket.off('disconnect', handleDisconnect);
           connectedSocket.off('connect_error', handleConnectError);
+          connectedSocket.off('connect_error', handleAuthConnectError);
+          connectedSocket.off('auth:expired', handleAuthExpired);
           connectedSocket.off('message:new', handleIncomingMessage);
           connectedSocket.off('message:notification', handleMessageNotification);
           connectedSocket.off('notification:new', handleNotification);
@@ -376,23 +369,11 @@ export const AppProvider = ({
     }
   }, [showToast]);
 
-  const openPropertyProfile = useCallback((propertyId: string) => {
-    setViewParams({ propertyId });
-    setActiveView('property-profile');
-
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
   const openUserProfile = useCallback((username: string) => {
     setViewParams({ username, refreshKey: Date.now() });
     setActiveView('user-profile');
 
     window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  const openListingDetail = useCallback((listingId: string) => {
-    setViewParams({ listingId });
-    setActiveView('home');
   }, []);
 
   const switchUserRole = useCallback(async (role: UserRole): Promise<void> => {
@@ -422,23 +403,6 @@ export const AppProvider = ({
     }
   }, [onSignOut, showToast]);
 
-  const openScheduleVisit = useCallback((
-    propertyId: string,
-    propertyTitle: string,
-    ownerId: string
-  ) => {
-    setScheduleVisitData({
-      isOpen: true,
-      propertyId,
-      propertyTitle,
-      ownerId,
-    });
-  }, []);
-
-  const closeScheduleVisit = useCallback(() => {
-    setScheduleVisitData({ isOpen: false });
-  }, []);
-
   const openNotifications = useCallback(() => setIsNotificationsOpen(true), []);
   const closeNotifications = useCallback(() => setIsNotificationsOpen(false), []);
 
@@ -458,9 +422,7 @@ export const AppProvider = ({
     unreadNotificationsCount,
     unreadMessagesCount,
     openChatWith,
-    openPropertyProfile,
     openUserProfile,
-    openListingDetail,
     switchUserRole,
     signOut,
     toasts,
@@ -469,9 +431,6 @@ export const AppProvider = ({
     refreshNotifications,
     refreshUnreadMessages,
     realtimeSocket,
-    scheduleVisitData,
-    openScheduleVisit,
-    closeScheduleVisit,
     isNotificationsOpen,
     openNotifications,
     closeNotifications,
@@ -482,7 +441,6 @@ export const AppProvider = ({
     activeView,
     closeCreateModal,
     closeNotifications,
-    closeScheduleVisit,
     closeSearch,
     createModalTab,
     currentUser,
@@ -492,16 +450,12 @@ export const AppProvider = ({
     openChatWith,
     openCreateModal,
     openNotifications,
-    openPropertyProfile,
-    openScheduleVisit,
     openSearch,
     openUserProfile,
-    openListingDetail,
     realtimeSocket,
     refreshNotifications,
     refreshUnreadMessages,
     refreshUserData,
-    scheduleVisitData,
     showToast,
     signOut,
     switchUserRole,
@@ -515,7 +469,7 @@ export const AppProvider = ({
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-200 flex items-center justify-center">
         <p className="text-sm">
-          Loading your RentReel account...
+          Loading your InstRent account...
         </p>
       </div>
     );
