@@ -1,6 +1,6 @@
 # Instrent
 #Demo
-( https://instrent.sooty.vercel.app)
+(https://instrent-sooty.vercel.app)
 
 A React + Vite + TypeScript rental marketplace app.
 
