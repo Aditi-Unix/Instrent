@@ -13,6 +13,7 @@ export interface User {
   roles: UserRole[];
   activeRole: UserRole;
   isVerified: boolean;
+  isOpenToRoommates: boolean;
   city: string;
   locationArea: string;
   occupation?: OccupationType;
@@ -127,6 +128,8 @@ export interface Notification {
   userId: string;
   type:
     | 'NEW_MESSAGE'
+    | 'NEW_POST'
+    | 'NEW_REEL'
     | 'COMMENT'
     | 'ROOM_INQUIRY'
     | 'LIKE'
@@ -162,5 +165,3 @@ export type ActiveView =
   | 'saved'
   | 'settings'
   | 'user-profile';
-
-

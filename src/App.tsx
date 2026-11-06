@@ -6,6 +6,7 @@ import { MobileNav } from './components/layout/MobileNav.tsx';
 import { Header } from './components/layout/Header.tsx';
 import { NotificationsDrawer } from './components/notifications/NotificationsDrawer.tsx';
 import { SearchModal } from './components/search/SearchModal.tsx';
+import { PageLoader } from './components/loading/index.ts';
 
 const HomeView = React.lazy(() => import('./components/home/HomeView.tsx').then(({ HomeView }) => ({ default: HomeView })));
 const ReelsView = React.lazy(() => import('./components/reels/ReelsView.tsx').then(({ ReelsView }) => ({ default: ReelsView })));
@@ -52,13 +53,9 @@ const AppContent: React.FC = () => {
         />
 
         {/* View Routing */}
-        <main className="flex-1 overflow-x-hidden">
+        <main className="flex-1 overflow-x-hidden pb-20 md:pb-0">
           <Suspense
-            fallback={
-              <div role="status" className="flex min-h-48 items-center justify-center text-sm text-zinc-400">
-                Loading view...
-              </div>
-            }
+            fallback={<PageLoader />}
           >
             {activeView === 'home' && <HomeView />}
             {activeView === 'reels' && <ReelsView />}
@@ -89,7 +86,7 @@ const AppContent: React.FC = () => {
 
       {/* Global Modals & Drawers */}
       {isCreateModalOpen && (
-        <Suspense fallback={null}>
+        <Suspense fallback={<PageLoader fullScreen={false} />}>
           <CreateModal />
         </Suspense>
       )}

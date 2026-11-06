@@ -44,6 +44,7 @@ import {
   verifyPassword,
 } from './auth.js';
 import { EmailDeliveryError } from './email.js';
+import { presenceRegistry } from './presence.js';
 
 const logger = pino({ level: env.NODE_ENV === 'production' ? 'info' : 'debug' });
 const port = env.PORT;
@@ -99,16 +100,27 @@ const decodeCursor = (cursor: unknown) => {
     const value = JSON.parse(Buffer.from(parsed.data, 'base64url').toString('utf8')) as {
       createdAt?: unknown;
       id?: unknown;
+      roomFeedRank?: unknown;
     };
     const createdAt = typeof value.createdAt === 'string' ? new Date(value.createdAt) : null;
     if (!createdAt || Number.isNaN(createdAt.getTime()) || typeof value.id !== 'string') return undefined;
-    return { createdAt, id: value.id };
+    return {
+      createdAt,
+      id: value.id,
+      roomFeedRank: typeof value.roomFeedRank === 'number' && Number.isInteger(value.roomFeedRank)
+        ? value.roomFeedRank
+        : undefined,
+    };
   } catch {
     return undefined;
   }
 };
-const encodeCursor = (createdAt: Date, id: string) =>
-  Buffer.from(JSON.stringify({ createdAt: createdAt.toISOString(), id })).toString('base64url');
+const encodeCursor = (createdAt: Date, id: string, roomFeedRank?: number) =>
+  Buffer.from(JSON.stringify({
+    createdAt: createdAt.toISOString(),
+    id,
+    ...(roomFeedRank === undefined ? {} : { roomFeedRank }),
+  })).toString('base64url');
 
 const usernameBase = (name: string, userId: string) => {
   const safeName = name.toLowerCase().replace(/[^a-z0-9_]+/g, '').slice(0, 18);
@@ -242,6 +254,7 @@ app.get('/api/users/discover', requireUser, async (req, res, next) => {
     const users = await prisma.user.findMany({
       where: {
         id: { not: viewer.id },
+        isOpenToRoommates: true,
         ...(query ? {
           OR: [
             { name: { contains: query, mode: 'insensitive' } },
@@ -263,11 +276,11 @@ app.get('/api/users/discover', requireUser, async (req, res, next) => {
     res.json({
       users: users.map((user) => ({
         ...user,
-        isOnline: user.lastSeenAt !== null && user.lastSeenAt >= cutoff,
+        isOnline: presenceRegistry.isOnline(user.id) && user.lastSeenAt !== null && user.lastSeenAt >= cutoff,
         isFollowing: user.followers.length > 0,
         followers: undefined,
       })),
-      onlineCount: users.filter((user) => user.lastSeenAt !== null && user.lastSeenAt >= cutoff).length,
+      onlineCount: users.filter((user) => presenceRegistry.isOnline(user.id) && user.lastSeenAt !== null && user.lastSeenAt >= cutoff).length,
       presenceTimeoutSeconds: env.PRESENCE_TIMEOUT_SECONDS,
     });
   } catch (error) {
@@ -576,15 +589,27 @@ app.post('/api/auth/reset-password', async (req, res, next) => {
 app.post('/api/auth/logout', async (req, res, next) => {
   try {
     if (!sameOrigin(req, res)) return;
+    const authorization = req.header('authorization');
+    const accessToken = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+    const authenticatedUser = accessToken ? await verifyAccessToken(accessToken).catch(() => null) : null;
     const rawToken = parseCookie(req.headers.cookie, refreshCookieName);
     if (rawToken) {
       const session = await prisma.refreshSession.findUnique({ where: { tokenHash: hashValue(rawToken) }, select: { userId: true, id: true } });
-      if (session) {
+      if (session && (!authenticatedUser || session.userId === authenticatedUser.id)) {
         await prisma.refreshSession.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
-        io.in(`user:${session.userId}`).disconnectSockets(true);
+        if (presenceRegistry.removeAll(session.userId)) {
+          await prisma.user.update({ where: { id: session.userId }, data: { lastSeenAt: new Date() } });
+          io.emit('presence:offline', { userId: session.userId });
+        }
+        const sockets = await io.fetchSockets();
+        for (const socket of sockets) {
+          if (socket.data.userId === session.userId && (!accessToken || socket.handshake.auth?.token === accessToken)) {
+            socket.disconnect(true);
+          }
+        }
       }
     }
-    clearRefreshCookie(res);
+    if (!authenticatedUser || !rawToken) clearRefreshCookie(res);
     res.status(204).end();
   } catch (error) {
     next(error);
@@ -829,6 +854,7 @@ const serializeUser = async (user: DbUser, currentUserId?: string) => {
     roles: [activeRole],
     activeRole,
     isVerified: user.isVerified,
+    isOpenToRoommates: user.isOpenToRoommates,
     city: user.city,
     locationArea: user.locationArea,
     occupation: user.occupation || undefined,
@@ -952,6 +978,11 @@ app.get('/api/posts', requireUser, async (req, res, next) => {
       return;
     }
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+    const category = typeof req.query.category === 'string' ? req.query.category : undefined;
+    if (category !== undefined && category !== 'rooms' && category !== 'recent') {
+      res.status(400).json({ error: 'Invalid post category.' });
+      return;
+    }
     const cursor = decodeCursor(req.query.cursor);
     if (req.query.cursor !== undefined && !cursor) {
       res.status(400).json({ error: 'Invalid feed cursor.' });
@@ -959,10 +990,19 @@ app.get('/api/posts', requireUser, async (req, res, next) => {
     }
     const rawTake = Number(req.query.take);
     const take = Number.isInteger(rawTake) ? Math.min(Math.max(rawTake, 1), 50) : 20;
+    const now = new Date();
+    const recentSince = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const posts = await prisma.post.findMany({
       where: {
         ...(userId ? { authorId: userId } : {}),
-        ...(cursor ? {
+        ...(category === 'rooms' || category === 'recent' ? { rent: { not: null } } : {}),
+        ...(category === 'recent' ? { createdAt: { gte: recentSince, lte: now } } : {}),
+        ...(category === 'rooms' && cursor?.roomFeedRank !== undefined ? {
+          OR: [
+            { roomFeedRank: { gt: cursor.roomFeedRank } },
+            { roomFeedRank: cursor.roomFeedRank, id: { gt: cursor.id } },
+          ],
+        } : cursor ? {
           OR: [
             { createdAt: { lt: cursor.createdAt } },
             { createdAt: cursor.createdAt, id: { lt: cursor.id } },
@@ -976,7 +1016,9 @@ app.get('/api/posts', requireUser, async (req, res, next) => {
         likes: { where: { userId: signedInUser.id }, select: { id: true } },
         saves: { where: { userId: signedInUser.id }, select: { id: true } },
       },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      orderBy: category === 'rooms'
+        ? [{ roomFeedRank: 'asc' }, { id: 'asc' }]
+        : [{ createdAt: 'desc' }, { id: 'desc' }],
       take: take + 1,
     });
     const hasMore = posts.length > take;
@@ -995,7 +1037,11 @@ app.get('/api/posts', requireUser, async (req, res, next) => {
         isFollowingOwner: followingIds.has(post.authorId),
       }))),
       nextCursor: hasMore && items.length
-        ? encodeCursor(items[items.length - 1].createdAt, items[items.length - 1].id)
+        ? encodeCursor(
+            items[items.length - 1].createdAt,
+            items[items.length - 1].id,
+            category === 'rooms' ? items[items.length - 1].roomFeedRank : undefined,
+          )
         : null,
     });
   } catch (error) {
@@ -1079,7 +1125,7 @@ app.post('/api/reels', requireUser, async (req, res, next) => {
       res.status(400).json({ error: 'Upload an MP4, WebM, or MOV video.' });
       return;
     }
-    const reelId = await persistThenPublish(
+    const createdReel = await persistThenPublish(
       () => prisma.$transaction(async (transaction) => {
         const attached = await transaction.mediaUpload.updateMany({
           where: {
@@ -1106,10 +1152,30 @@ app.post('/api/reels', requireUser, async (req, res, next) => {
           },
           select: { id: true },
         });
-        return created.id;
+        const followers = await transaction.follow.findMany({
+          where: { followedId: user.id },
+          select: { followerId: true },
+        });
+        if (followers.length) {
+          await transaction.notification.createMany({
+            data: followers.map(({ followerId }) => ({
+              userId: followerId,
+              type: 'NEW_REEL',
+              title: 'New room reel',
+              message: `${user.name} shared a new room reel.`,
+              metadata: { reelId: created.id, username: user.username },
+              dedupeKey: `reel-created:${created.id}:${followerId}`,
+            })),
+          });
+        }
+        return { id: created.id, followerIds: followers.map(({ followerId }) => followerId) };
       }, { maxWait: 10_000, timeout: 20_000 }),
-      (id) => io.emit('reel:changed', { reelId: id, authorId: user.id }),
+      ({ id, followerIds }) => {
+        io.emit('reel:changed', { reelId: id, authorId: user.id });
+        followerIds.forEach((followerId) => io.to(`user:${followerId}`).emit('notification:new'));
+      },
     );
+    const reelId = createdReel.id;
     const reel = await prisma.reel.findUnique({
       where: { id: reelId },
       include: {
@@ -1634,7 +1700,7 @@ app.post('/api/posts', requireUser, async (req, res, next) => {
     const assets = await Promise.all(parsedIds.data.map((publicId) =>
       verifyUploadedAsset(publicId, 'image', user.id, 10 * 1024 * 1024),
     ));
-    const postId = await persistThenPublish(
+    const createdPost = await persistThenPublish(
       () => prisma.$transaction(async (transaction) => {
         const attached = await transaction.mediaUpload.updateMany({
           where: {
@@ -1656,6 +1722,7 @@ app.post('/api/posts', requireUser, async (req, res, next) => {
             location: typeof location === 'string' ? location.trim().slice(0, 120) : '',
             rent: Number.isInteger(rent) && Number(rent) > 0 ? Number(rent) : null,
             roomType: typeof roomType === 'string' ? roomType.slice(0, 40) : null,
+            roomFeedRank: Math.floor(Math.random() * 2147483647),
             media: {
               create: assets.map((asset, position) => ({
                 url: asset.url,
@@ -1666,10 +1733,30 @@ app.post('/api/posts', requireUser, async (req, res, next) => {
           },
           select: { id: true },
         });
-        return post.id;
+        const followers = await transaction.follow.findMany({
+          where: { followedId: user.id },
+          select: { followerId: true },
+        });
+        if (followers.length) {
+          await transaction.notification.createMany({
+            data: followers.map(({ followerId }) => ({
+              userId: followerId,
+              type: 'NEW_POST',
+              title: 'New room post',
+              message: `${user.name} shared a new room post.`,
+              metadata: { postId: post.id, username: user.username },
+              dedupeKey: `post-created:${post.id}:${followerId}`,
+            })),
+          });
+        }
+        return { id: post.id, followerIds: followers.map(({ followerId }) => followerId) };
       }, { maxWait: 10_000, timeout: 20_000 }),
-      (id) => io.emit('post:changed', { postId: id, authorId: user.id }),
+      ({ id, followerIds }) => {
+        io.emit('post:changed', { postId: id, authorId: user.id });
+        followerIds.forEach((followerId) => io.to(`user:${followerId}`).emit('notification:new'));
+      },
     );
+    const postId = createdPost.id;
     const post = await prisma.post.findUnique({
       where: { id: postId },
       include: {
@@ -2181,6 +2268,13 @@ app.patch('/api/users/me', requireUser, async (req, res, next) => {
       }
     }
     if (body.occupation === null) update.occupation = null;
+    if (body.isOpenToRoommates !== undefined) {
+      if (typeof body.isOpenToRoommates !== 'boolean') {
+        res.status(400).json({ error: 'Open to roommates must be true or false.' });
+        return;
+      }
+      update.isOpenToRoommates = body.isOpenToRoommates;
+    }
     const updatedUser = avatarAsset
       ? await prisma.$transaction(async (transaction) => {
           const attached = await transaction.mediaUpload.updateMany({
@@ -2566,6 +2660,9 @@ app.post('/api/messages', requireUser, async (req, res, next) => {
       } });
       return;
     }
+    const recipientConversationRoom = `conversation:${conversationId}`;
+    const recipientIsViewingConversation = Array.from(io.sockets.adapter.rooms.get(recipientConversationRoom) ?? [])
+      .some((socketId) => io.sockets.sockets.get(socketId)?.data.userId === receiverId);
     const message = await persistThenPublish(
       () => prisma.$transaction(async (transaction) => {
         const saved = await transaction.message.create({
@@ -2582,16 +2679,18 @@ app.post('/api/messages', requireUser, async (req, res, next) => {
           where: { id: conversationId },
           data: { updatedAt: new Date() },
         });
-        await transaction.notification.create({
-          data: {
-            userId: receiverId,
-            type: 'NEW_MESSAGE',
-            title: 'New message',
-            message: `${user.name} sent you a message.`,
-            metadata: { conversationId },
-            dedupeKey: `message:${saved.id}`,
-          },
-        });
+        if (!recipientIsViewingConversation) {
+          await transaction.notification.create({
+            data: {
+              userId: receiverId,
+              type: 'NEW_MESSAGE',
+              title: 'New message',
+              message: `${user.name} sent you a message.`,
+              metadata: { conversationId },
+              dedupeKey: `message:${saved.id}`,
+            },
+          });
+        }
         return saved;
       }),
       (saved) => {
@@ -2614,7 +2713,9 @@ app.post('/api/messages', requireUser, async (req, res, next) => {
           conversationId,
           message: savedMessage,
         });
-        io.to(`user:${receiverId}`).emit('notification:new');
+        if (!recipientIsViewingConversation) {
+          io.to(`user:${receiverId}`).emit('notification:new');
+        }
         io.to(`user:${receiverId}`).emit('conversation:changed', { conversationId });
       },
     );

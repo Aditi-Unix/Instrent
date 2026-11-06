@@ -32,12 +32,23 @@ html {
 body {
   margin: 0;
   min-height: 100vh;
+  overflow-x: hidden;
   background:
     radial-gradient(circle at top, rgba(244, 63, 94, 0.12), transparent 30%),
     #09090b;
   color: #f4f4f5;
   font-family: 'Inter', 'Segoe UI', sans-serif;
   line-height: 1.7;
+}
+
+@media (max-width: 767px) {
+  html {
+    font-size: 16px;
+  }
+
+  body {
+    line-height: 1.5;
+  }
 }
 
 #root {
@@ -73,6 +84,28 @@ textarea:focus-visible,
 a:focus-visible {
   outline: 3px solid rgba(251, 113, 133, 0.55);
   outline-offset: 2px;
+}
+
+button {
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 120ms ease, opacity 160ms ease;
+}
+
+button:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+button:not(:disabled):hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button {
+    transition: none;
+  }
+
+  button:not(:disabled):active {
+    transform: none;
+  }
 }
 
 img {

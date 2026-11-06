@@ -15,6 +15,7 @@ import axios from 'axios';
 
 export const API_URL = import.meta.env.VITE_API_URL ?? '';
 const BASE_URL = `${API_URL}/api`;
+const API_REQUEST_TIMEOUT_MS = 20_000;
 
 let accessToken: string | null = null;
 let refreshPromise: Promise<string> | null = null;
@@ -47,15 +48,21 @@ export function clearAuthTokens() {
 }
 
 export function hasSessionHint() {
-  return localStorage.getItem(sessionHintKey) === '1';
+  if (sessionStorage.getItem(sessionHintKey) === '1') return true;
+  if (localStorage.getItem(sessionHintKey) === '1') {
+    sessionStorage.setItem(sessionHintKey, '1');
+    localStorage.removeItem(sessionHintKey);
+    return true;
+  }
+  return false;
 }
 
 export function markSessionActive() {
-  localStorage.setItem(sessionHintKey, '1');
+  sessionStorage.setItem(sessionHintKey, '1');
 }
 
 export function clearSessionHint() {
-  localStorage.removeItem(sessionHintKey);
+  sessionStorage.removeItem(sessionHintKey);
 }
 
 export function notifyAuthExpired() {
@@ -69,7 +76,10 @@ export function getAccessToken(): string | null {
 async function refreshAccessToken() {
   if (!refreshPromise) {
     const generationAtStart = authGeneration;
-    const request = axios.post<{ accessToken: string }>(`${BASE_URL}/auth/refresh`, undefined, { withCredentials: true })
+    const request = axios.post<{ accessToken: string }>(`${BASE_URL}/auth/refresh`, undefined, {
+      withCredentials: true,
+      timeout: API_REQUEST_TIMEOUT_MS,
+    })
       .then((response) => {
         if (authGeneration === generationAtStart) setAuthTokens(response.data);
         return response.data.accessToken;
@@ -143,14 +153,39 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
     const headers = new Headers(init.headers);
     if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
     if (token) headers.set('Authorization', `Bearer ${token}`);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, API_REQUEST_TIMEOUT_MS);
+    const abortRequest = () => controller.abort();
+    init.signal?.addEventListener('abort', abortRequest, { once: true });
     return fetch(`${BASE_URL}${path}`, {
       ...init,
       headers,
+      signal: controller.signal,
       credentials: 'include',
+    }).catch((error: unknown) => {
+      if (timedOut) {
+        throw new ApiError('The server took too long to respond. Please try again.', { code: 'REQUEST_TIMEOUT' });
+      }
+      throw error;
+    }).finally(() => {
+      window.clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abortRequest);
     });
   };
 
-  let response = await request(accessToken);
+  let response: Response;
+  try {
+    response = await request(accessToken);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Unable to reach the server. Please check your connection and try again.', {
+      code: 'NETWORK_ERROR',
+    });
+  }
   if (!isPublicAuthEndpoint && response.status === 401) {
     try {
       response = await request(await refreshAccessToken());
@@ -199,7 +234,10 @@ export const api = {
     verifyResetOtp: (data: { email: string; code: string }) => publicJson<{ grant: string }>('/auth/verify-reset-otp', data),
     resetPassword: (data: { grant: string; password: string }) => publicJson<{ accessToken: string; user: User }>('/auth/reset-password', data),
     logout: async () => {
-      await axios.post(`${BASE_URL}/auth/logout`, undefined, { withCredentials: true }).catch(() => undefined);
+      await axios.post(`${BASE_URL}/auth/logout`, undefined, {
+        withCredentials: true,
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+      }).catch(() => undefined);
       clearAuthTokens();
       clearSessionHint();
     },
@@ -452,10 +490,11 @@ export const api = {
     fetchJson<{ success: boolean }>(`/comments/${id}`, { method: 'DELETE' }),
 
   // Posts & Profiles
-  getPosts: (userId?: string, cursor?: string) => {
+  getPosts: (userId?: string, cursor?: string, category?: 'rooms' | 'recent') => {
     const params = new URLSearchParams();
     if (userId) params.set('userId', userId);
     if (cursor) params.set('cursor', cursor);
+    if (category) params.set('category', category);
     const query = params.toString();
     return fetchJson<{ posts: Post[]; nextCursor: string | null }>(`/posts${query ? `?${query}` : ''}`);
   },
@@ -501,7 +540,7 @@ export const api = {
       body: JSON.stringify(data),
     }),
   updateMyProfile: (
-    data: Omit<Partial<Pick<User, 'name' | 'username' | 'bio' | 'city' | 'locationArea' | 'occupation' | 'instituteOrCompany'>>, 'occupation'> & {
+    data: Omit<Partial<Pick<User, 'name' | 'username' | 'bio' | 'city' | 'locationArea' | 'occupation' | 'instituteOrCompany' | 'isOpenToRoommates'>>, 'occupation'> & {
       occupation?: User['occupation'] | null;
       avatarPublicId?: string;
     },

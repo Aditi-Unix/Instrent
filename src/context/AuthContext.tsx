@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { User } from '../types/client.ts';
-import { api, clearAuthTokens, clearSessionHint, markSessionActive, setAuthTokens } from '../lib/api.ts';
+import { api, clearAuthTokens, clearSessionHint, hasSessionHint, markSessionActive, setAuthTokens } from '../lib/api.ts';
+import { PageLoader } from '../components/loading/index.ts';
 
 type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated';
 type AuthContextValue = {
@@ -21,13 +22,13 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 const logoutEventKey = 'rentreel-auth-event';
 
-const broadcastLogout = () => {
+const broadcastLogout = (userId: string) => {
   if ('BroadcastChannel' in window) {
     const channel = new BroadcastChannel('rentreel-auth');
-    channel.postMessage({ type: 'logout' });
+    channel.postMessage({ type: 'logout', userId });
     channel.close();
   }
-  localStorage.setItem(logoutEventKey, String(Date.now()));
+  localStorage.setItem(logoutEventKey, JSON.stringify({ userId, at: Date.now() }));
   localStorage.removeItem(logoutEventKey);
 };
 
@@ -37,50 +38,66 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const loading = status === 'loading';
 
   const logout = useCallback(async () => {
-    clearAuthTokens();
+    const userId = user?.id;
     await api.auth.logout();
+    clearAuthTokens();
     clearSessionHint();
     setUser(null);
     setStatus('unauthenticated');
-    broadcastLogout();
-  }, []);
+    if (userId) broadcastLogout(userId);
+  }, [user]);
 
   useEffect(() => {
     let active = true;
-    void api.auth.restore()
-      .then((result) => {
-        if (active) {
-          setUser(result.user);
-          setStatus('authenticated');
-        }
-      })
-      .catch(() => {
-        if (active) {
-          clearAuthTokens();
-          clearSessionHint();
-          setStatus('unauthenticated');
-        }
-      });
+    if (hasSessionHint()) {
+      void api.auth.restore()
+        .then((result) => {
+          if (active) {
+            setUser(result.user);
+            setStatus('authenticated');
+          }
+        })
+        .catch(() => {
+          if (active) {
+            clearAuthTokens();
+            clearSessionHint();
+            setStatus('unauthenticated');
+          }
+        });
+    } else {
+      setStatus('unauthenticated');
+    }
     const channel = 'BroadcastChannel' in window ? new BroadcastChannel('rentreel-auth') : null;
-    const onLogout = () => {
+    const applyLogout = () => {
       clearAuthTokens();
       clearSessionHint();
       setUser(null);
       setStatus('unauthenticated');
     };
-    channel?.addEventListener('message', onLogout);
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === logoutEventKey) onLogout();
+    const onChannelLogout = (event: MessageEvent<{ type?: string; userId?: string }>) => {
+      if (event.data?.userId === user?.id) applyLogout();
     };
-    window.addEventListener('rentreel-auth-expired', onLogout);
+    const onAuthExpired = () => applyLogout();
+    channel?.addEventListener('message', onChannelLogout);
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== logoutEventKey || !event.newValue) return;
+      try {
+        const payload = JSON.parse(event.newValue) as { userId?: string };
+        if (payload.userId === user?.id) applyLogout();
+      } catch {
+        return;
+      }
+    };
+    window.addEventListener('rentreel-auth-expired', onAuthExpired);
     window.addEventListener('storage', onStorage);
     return () => {
       active = false;
+      channel?.removeEventListener('message', onChannelLogout);
       channel?.close();
       window.removeEventListener('storage', onStorage);
-      window.removeEventListener('rentreel-auth-expired', onLogout);
+      window.removeEventListener('rentreel-auth-expired', onAuthExpired);
     };
-  }, []);
+  }, [user?.id]);
 
   const value = useMemo<AuthContextValue>(() => ({
     user,
@@ -142,12 +159,12 @@ export function useAuth() {
 
 export function ProtectedRoute({ children }: { children: ReactNode }) {
   const { status } = useAuth();
-  if (status === 'loading') return <div className="min-h-screen bg-zinc-950 flex items-center justify-center text-zinc-300">Loading InstRent...</div>;
+  if (status === 'loading') return <PageLoader />;
   return status === 'authenticated' ? children : null;
 }
 
 export function GuestRoute({ children }: { children: ReactNode }) {
   const { status } = useAuth();
-  if (status === 'loading') return <div className="min-h-screen bg-zinc-950 flex items-center justify-center text-zinc-300">Loading InstRent...</div>;
+  if (status === 'loading') return <PageLoader />;
   return status === 'unauthenticated' ? children : null;
 }
